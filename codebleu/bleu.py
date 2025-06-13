@@ -10,8 +10,9 @@
 """BLEU score implementation."""
 import math
 from collections import Counter
+from typing import List, Sequence, Callable, Optional
 
-from .utils import ngrams
+from .utils import ngrams, get_mod_lines
 
 
 def sentence_bleu(
@@ -436,3 +437,157 @@ class SmoothingFunction:
         Smoothing method 1: Add *epsilon* counts to precision with 0 counts.
         """
         return [((p_i[0] + self.epsilon), p_i[1]) if p_i[0] == 0 else p_i for p_i in p_n]
+
+
+# ADDED FOR DIFF-AWARE BLEU -----------------------------------------------
+
+# Sentinel token used internally to mark boundaries; never emitted outside this
+_SENTINEL = "<@@>"
+
+
+def _tokens_by_runs(code: str, mod_lines: List[int], tokenizer: Callable[[str], List[str]]) -> List[List[str]]:
+    """Return a list with one entry per *contiguous* run of *mod_lines*.
+
+    Each entry is a flat list of tokens for the lines in that run.  Lines that
+    are not present in *mod_lines* are ignored, and runs that end up empty are
+    skipped.  Line numbers are 1-based, matching *get_mod_lines*.
+    """
+    if not mod_lines:
+        return []
+
+    lines = code.splitlines()
+    # sort & de-duplicate to be safe
+    mod_lines_sorted = sorted(set(l for l in mod_lines if 1 <= l <= len(lines)))
+
+    runs: List[List[str]] = []
+    current_run: List[str] = []
+    prev_line: Optional[int] = None
+
+    for ln in mod_lines_sorted:
+        if prev_line is None or ln == prev_line + 1:
+            # still in the same contiguous run
+            current_run.extend(tokenizer(lines[ln - 1]))
+        else:
+            # gap – finish current run and start a new one
+            if current_run:
+                runs.append(current_run)
+            current_run = tokenizer(lines[ln - 1])
+        prev_line = ln
+    if current_run:
+        runs.append(current_run)
+
+    return runs
+
+
+def _modified_precision_runs(
+    references_runs: List[List[List[str]]],  # list(ref) -> list(run) -> tokens
+    hypothesis_runs: List[List[str]],
+    n: int,
+):
+    """Compute *modified precision* for order *n* limited to the supplied runs."""
+    # Collect n-gram counts for the hypothesis runs
+    counts = Counter()
+    for run_tokens in hypothesis_runs:
+        if len(run_tokens) >= n:
+            counts.update(ngrams(run_tokens, n))
+
+    # Union of reference counts (max per n-gram over refs)
+    max_counts: Counter = Counter()
+    for ref_runs in references_runs:
+        ref_counter = Counter()
+        for run_tokens in ref_runs:
+            if len(run_tokens) >= n:
+                ref_counter.update(ngrams(run_tokens, n))
+        for ngram, cnt in ref_counter.items():
+            if cnt > max_counts[ngram]:
+                max_counts[ngram] = cnt
+
+    # Clip the counts
+    clipped_counts = {ngram: min(count, max_counts[ngram]) for ngram, count in counts.items()}
+
+    numerator = sum(clipped_counts.values())
+    denominator = max(1, sum(counts.values()))
+    return numerator, denominator
+
+
+def corpus_bleu_diff(
+    references: Sequence[Sequence[str]],
+    hypotheses: Sequence[str],
+    ref_diffs: Sequence[Sequence[str]],
+    hyp_diffs: Sequence[str],
+    weights: tuple[float, ...] = (0.25, 0.25, 0.25, 0.25),
+    smoothing_function: Callable | None = None,
+    tokenizer: Callable[[str], List[str]] | None = None,
+    view: str = "added",
+):
+    """Compute corpus-level BLEU but *only* over lines modified in the supplied diffs.
+
+    Parameters mirror those of *corpus_bleu* with two additions:
+        ref_diffs - same nesting as *references* (outer N examples, inner M refs)
+        hyp_diffs - list with N unified-diff strings for the hypotheses
+        view - 'added' or 'deleted' indicating which side of the diff to use
+    """
+    if tokenizer is None:
+        tokenizer = lambda s: s.split()
+
+    assert len(references) == len(hypotheses) == len(ref_diffs) == len(hyp_diffs), (
+        "Mismatch in number of samples between references/hypotheses/diffs"
+    )
+
+    # Prepare corpus-level accumulators
+    p_numerators = Counter()
+    p_denominators = Counter()
+    hyp_lengths = 0
+    ref_lengths = 0
+
+    for refs_code_list, hyp_code, refs_diff_list, hyp_diff in zip(
+        references, hypotheses, ref_diffs, hyp_diffs
+    ):
+        # Collect modified lines for hyp & refs
+        hyp_mod_lines = get_mod_lines(hyp_diff, view)
+        hyp_runs_tokens = _tokens_by_runs(hyp_code, hyp_mod_lines, tokenizer)
+
+        # hypothesis length: total tokens within modified runs
+        hyp_len = sum(len(run) for run in hyp_runs_tokens)
+        hyp_lengths += hyp_len
+
+        # Prepare reference runs + lengths
+        refs_runs_tokenised: List[List[List[str]]] = []
+        ref_lens = []
+        for ref_code, ref_diff in zip(refs_code_list, refs_diff_list):
+            ref_mod_lines = get_mod_lines(ref_diff, view)
+            ref_runs_tokens = _tokens_by_runs(ref_code, ref_mod_lines, tokenizer)
+            refs_runs_tokenised.append(ref_runs_tokens)
+            ref_lens.append(sum(len(run) for run in ref_runs_tokens))
+
+        # Closest reference length for BP
+        ref_lengths += min(ref_lens, key=lambda rl: (abs(rl - hyp_len), rl)) if ref_lens else 0
+
+        # For each n-gram order
+        for i, _ in enumerate(weights, start=1):
+            num, denom = _modified_precision_runs(refs_runs_tokenised, hyp_runs_tokens, i)
+            p_numerators[i] += num
+            p_denominators[i] += denom
+
+    # If there are no unigrams matches, return 0 to avoid log(0)
+    if p_numerators[1] == 0:
+        return 0.0
+
+    # Brevity penalty
+    bp = brevity_penalty(ref_lengths, hyp_lengths)
+
+    # Smoothing
+    if smoothing_function is None:
+        smoothing_function = SmoothingFunction().method1
+
+    p_n = [
+        (p_numerators[i], p_denominators[i]) for i, _ in enumerate(weights, start=1)
+    ]
+    p_n = smoothing_function(p_n)
+
+    # Final BLEU computation
+    s = (w_i * math.log(p_i[0] / p_i[1]) for w_i, p_i in zip(weights, p_n))
+    bleu_score = bp * math.exp(math.fsum(s))
+    return bleu_score
+
+# ---------------------------------------------------------------------------

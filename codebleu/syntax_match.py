@@ -48,21 +48,33 @@ def corpus_syntax_match(references, candidates, ref_diffs, cand_diffs, lang, tre
     for i in range(len(candidates)):
         references_sample = references[i]
         candidate = candidates[i]
-        ref_diff = ref_diffs[i]
+        ref_diff_item = ref_diffs[i]
         cand_diff = cand_diffs[i]
-        for reference in references_sample:
-            try:
-                candidate = remove_comments_and_docstrings(candidate, lang)
-            except Exception:
-                pass
-            try:
-                reference = remove_comments_and_docstrings(reference, lang)
-            except Exception:
-                pass
 
-            candidate_tree = parser.parse(bytes(candidate, "utf8")).root_node
+        for j, reference in enumerate(references_sample):
+            # Select the appropriate diff for this particular reference.
+            if isinstance(ref_diff_item, list):
+                if j < len(ref_diff_item):
+                    ref_diff = ref_diff_item[j]
+                else:
+                    # Fallback to using the first diff if not enough provided.
+                    ref_diff = ref_diff_item[0]
+            else:
+                ref_diff = ref_diff_item
 
-            reference_tree = parser.parse(bytes(reference, "utf8")).root_node
+            # Clean code snippets
+            try:
+                cleaned_candidate = remove_comments_and_docstrings(candidate, lang)
+            except Exception:
+                cleaned_candidate = candidate
+
+            try:
+                cleaned_reference = remove_comments_and_docstrings(reference, lang)
+            except Exception:
+                cleaned_reference = reference
+
+            candidate_tree = parser.parse(bytes(cleaned_candidate, "utf8")).root_node
+            reference_tree = parser.parse(bytes(cleaned_reference, "utf8")).root_node
 
             def get_all_sub_trees(root_node):
                 node_stack = []
@@ -99,9 +111,6 @@ def corpus_syntax_match(references, candidates, ref_diffs, cand_diffs, lang, tre
             cand_sexps = [x[0] for x in get_all_sub_trees_in_diff(candidate_tree, cand_mod_lines)]
             ref_sexps = [x[0] for x in get_all_sub_trees_in_diff(reference_tree, ref_mod_lines)]
 
-            # TODO: fix, now we count number of reference subtrees matching candidate,
-            #       but we should count number of candidate subtrees matching reference
-            #       See (4) in "3.2 Syntactic AST Match" of https://arxiv.org/pdf/2009.10297.pdf
             for sub_tree in ref_sexps:
                 if sub_tree in cand_sexps:
                     match_count += 1

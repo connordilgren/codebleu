@@ -50,17 +50,32 @@ def calc_codebleu(
     references = [[x.strip() for x in ref] if isinstance(ref, list) else [ref.strip()] for ref in references]
     hypothesis = [x.strip() for x in predictions]
 
+    dev_diffs = [[x.strip() for x in ref] if isinstance(ref, list) else [ref.strip()] for ref in dev_diffs]
+    llm_diffs = [x.strip() for x in llm_diffs]
+
     # calculate ngram match (BLEU)
     if tokenizer is None:
-
         def tokenizer(s):
             return s.split()
 
-    tokenized_hyps = [tokenizer(x) for x in hypothesis]
-    tokenized_refs = [[tokenizer(x) for x in reference] for reference in references]
+    # calculate ngram match restricted to modified lines only
+    add_ngram_match_score = bleu.corpus_bleu_diff(
+        references,
+        hypothesis,
+        dev_diffs,
+        llm_diffs,
+        tokenizer=tokenizer,
+        view="added",
+    )
 
-    # ngram_match_score = bleu.corpus_bleu(tokenized_refs, tokenized_hyps)
-    ngram_match_score = 0  # TODO
+    del_ngram_match_score = bleu.corpus_bleu_diff(
+        references,
+        hypothesis,
+        dev_diffs,
+        llm_diffs,
+        tokenizer=tokenizer,
+        view="deleted",
+    )
 
     # # calculate weighted ngram match
     # with open(keywords_dir / (lang + ".txt"), "r", encoding="utf-8") as f:
@@ -97,14 +112,14 @@ def calc_codebleu(
 
     alpha, beta, gamma, theta = weights
     add_code_bleu_score = (
-        alpha * ngram_match_score
+        alpha * add_ngram_match_score
         + beta * weighted_ngram_match_score
         + gamma * add_syntax_match_score
         + theta * (add_dataflow_match_score or 1)
     )
 
     del_code_bleu_score = (
-        alpha * ngram_match_score
+        alpha * del_ngram_match_score
         + beta * weighted_ngram_match_score
         + gamma * del_syntax_match_score
         + theta * (del_dataflow_match_score or 1)
@@ -118,8 +133,8 @@ def calc_codebleu(
         "add_codebleu": add_code_bleu_score,
         "del_codebleu": del_code_bleu_score,
 
-        "add_ngram_match_score": ngram_match_score,
-        "del_ngram_match_score": ngram_match_score,
+        "add_ngram_match_score": add_ngram_match_score,
+        "del_ngram_match_score": del_ngram_match_score,
 
         "add_weighted_ngram_match_score": weighted_ngram_match_score,
         "del_weighted_ngram_match_score": weighted_ngram_match_score,
