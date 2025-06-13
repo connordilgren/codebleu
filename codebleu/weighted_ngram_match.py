@@ -14,8 +14,9 @@
 
 import math
 from collections import Counter
+from typing import Callable, List, Sequence, Tuple, Dict
 
-from .utils import ngrams
+from .utils import ngrams, get_mod_lines
 
 
 def sentence_bleu(
@@ -402,3 +403,191 @@ class SmoothingFunction:
         Smoothing method 1: Add *epsilon* counts to precision with 0 counts.
         """
         return [((p_i[0] + self.epsilon), p_i[1]) if p_i[0] == 0 else p_i for p_i in p_n]
+
+
+# ---------------- DIFF-AWARE WEIGHTED N-GRAM MATCH --------------------------
+
+# Sentinel token identical to that in bleu.py – internal use only
+_SENTINEL = "<@@>"
+
+
+def _tokens_by_runs(code: str, mod_lines: List[int], tokenizer: Callable[[str], List[str]]) -> List[List[str]]:
+    """Return tokens grouped by *contiguous* runs of *mod_lines* (1-based).
+
+    The logic mirrors the helper in *bleu.py* so that n-grams never span
+    non-consecutive modified lines.
+    """
+    if not mod_lines:
+        return []
+
+    lines = code.splitlines()
+    mod_lines_sorted = sorted(set(l for l in mod_lines if 1 <= l <= len(lines)))
+
+    runs: List[List[str]] = []
+    current_run: List[str] = []
+    prev_line: int | None = None
+
+    for ln in mod_lines_sorted:
+        if prev_line is None or ln == prev_line + 1:
+            # still inside the same contiguous run
+            current_run.extend(tokenizer(lines[ln - 1]))
+        else:
+            # gap – finalize previous run
+            if current_run:
+                runs.append(current_run)
+            current_run = tokenizer(lines[ln - 1])
+        prev_line = ln
+    if current_run:
+        runs.append(current_run)
+
+    return runs
+
+
+def _modified_recall_runs(
+    references_runs_and_weights: List[Tuple[List[List[str]], Dict[str, float]]],  # list(ref) -> (runs, weights)
+    hypothesis_runs: List[List[str]],
+    n: int,
+) -> Tuple[float, float]:
+    """Compute weighted *recall* for n-grams limited to supplied runs."""
+    # Collect n-gram counts for the hypothesis runs
+    hyp_counts = Counter()
+    for run_tokens in hypothesis_runs:
+        if len(run_tokens) >= n:
+            hyp_counts.update(ngrams(run_tokens, n))
+
+    numerator = 0.0
+    denominator = 0.0
+
+    for runs_tokens, weights_dict in references_runs_and_weights:
+        ref_counts = Counter()
+        for run_tokens in runs_tokens:
+            if len(run_tokens) >= n:
+                ref_counts.update(ngrams(run_tokens, n))
+
+        clipped_counts = {ng: min(cnt, hyp_counts[ng]) for ng, cnt in ref_counts.items()}
+
+        if n == 1:
+            # Apply keyword weighting on unigrams
+            def _weighted_sum(counts: Counter) -> float:
+                total = 0.0
+                for ngram, cnt in counts.items():
+                    token = ngram[0]
+                    w = weights_dict.get(token, 1.0)
+                    total += cnt * w
+                return total
+
+            numerator += _weighted_sum(clipped_counts)
+            denominator += max(1.0, _weighted_sum(ref_counts))
+        else:
+            numerator += sum(clipped_counts.values())
+            denominator += max(1.0, sum(ref_counts.values()))
+
+    return numerator, denominator
+
+
+def corpus_bleu_diff(
+    references: Sequence[Sequence[str]],
+    hypotheses: Sequence[str],
+    ref_diffs: Sequence[Sequence[str]],
+    hyp_diffs: Sequence[str],
+    *,
+    tokenizer: Callable[[str], List[str]] | None = None,
+    keywords: List[str] | None = None,
+    weights: Tuple[float, ...] = (0.25, 0.25, 0.25, 0.25),
+    smoothing_function: Callable | None = None,
+    view: str = "added",
+) -> float:
+    """Compute weighted corpus-level BLEU restricted to modified lines.
+
+    The behaviour mirrors :pyfunc:`bleu.corpus_bleu_diff` but incorporates the
+    keyword weighting scheme from *weighted_ngram_match*.
+
+    Parameters
+    ----------
+    references : list(list(str))
+        Code snippets for each reference.
+    hypotheses : list(str)
+        Code snippets produced by the model (after applying its diff).
+    ref_diffs : list(list(str))
+        Unified diff strings corresponding to *references*.
+    hyp_diffs : list(str)
+        Unified diff strings corresponding to *hypotheses*.
+    tokenizer : callable, optional
+        Function that maps a string → list(str). Default: `str.split`.
+    keywords : list(str), optional
+        Tokens that should receive full weight (1.0). Non-keywords receive
+        weight 0.2.
+    weights : tuple(float, …)
+        Standard BLEU n-gram weights (default BLEU-4).
+    view : {'added', 'deleted'}
+        Whether to consider added or deleted lines from the diffs.
+    """
+    if tokenizer is None:
+        tokenizer = lambda s: s.split()
+    if keywords is None:
+        keywords = []
+
+    assert len(references) == len(hypotheses) == len(ref_diffs) == len(hyp_diffs), (
+        "Mismatch in number of samples between references/hypotheses/diffs"
+    )
+
+    if view not in {"added", "deleted"}:
+        raise ValueError("view must be 'added' or 'deleted'")
+
+    # Accumulators for corpus-level modified precision/recall
+    p_numerators = Counter()
+    p_denominators = Counter()
+    hyp_lengths = 0
+    ref_lengths = 0
+
+    for refs_code_list, hyp_code, refs_diff_list, hyp_diff in zip(
+        references, hypotheses, ref_diffs, hyp_diffs
+    ):
+        # Hypothesis runs
+        hyp_mod_lines = get_mod_lines(hyp_diff, view)
+        hyp_runs_tokens = _tokens_by_runs(hyp_code, hyp_mod_lines, tokenizer)
+        hyp_len = sum(len(run) for run in hyp_runs_tokens)
+        hyp_lengths += hyp_len
+
+        # Prepare reference runs + weights
+        refs_runs_and_weights: List[Tuple[List[List[str]], Dict[str, float]]] = []
+        ref_lens = []
+        for ref_code, ref_diff in zip(refs_code_list, refs_diff_list):
+            ref_mod_lines = get_mod_lines(ref_diff, view)
+            ref_runs_tokens = _tokens_by_runs(ref_code, ref_mod_lines, tokenizer)
+            ref_lens.append(sum(len(run) for run in ref_runs_tokens))
+            # Build keyword weight mapping for *this* reference (unigrams only)
+            flat_tokens = [tok for run in ref_runs_tokens for tok in run]
+            weights_dict = {tok: (1.0 if tok in keywords else 0.2) for tok in flat_tokens}
+            refs_runs_and_weights.append((ref_runs_tokens, weights_dict))
+
+        # Closest reference length (for BP)
+        if ref_lens:
+            ref_lengths += min(ref_lens, key=lambda rl: (abs(rl - hyp_len), rl))
+        else:
+            ref_lengths += 0
+
+        for n_idx, _ in enumerate(weights, start=1):
+            num, denom = _modified_recall_runs(refs_runs_and_weights, hyp_runs_tokens, n_idx)
+            p_numerators[n_idx] += num
+            p_denominators[n_idx] += denom
+
+    # If no unigram matches, score is 0
+    if p_numerators[1] == 0:
+        return 0.0
+
+    bp = brevity_penalty(ref_lengths, hyp_lengths)
+
+    if smoothing_function is None:
+        smoothing_function = SmoothingFunction().method1
+
+    p_n = [
+        (p_numerators[i], p_denominators[i]) for i, _ in enumerate(weights, start=1)
+    ]
+    p_n = smoothing_function(p_n)
+
+    s = (w_i * math.log(p_i[0] / p_i[1]) for w_i, p_i in zip(weights, p_n))
+    bleu_score = bp * math.exp(math.fsum(s))
+    return bleu_score
+
+# ---------------------------------------------------------------------------

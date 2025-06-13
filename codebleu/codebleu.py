@@ -77,20 +77,29 @@ def calc_codebleu(
         view="deleted",
     )
 
-    # # calculate weighted ngram match
-    # with open(keywords_dir / (lang + ".txt"), "r", encoding="utf-8") as f:
-    #     keywords = [x.strip() for x in f.readlines()]
+    # calculate weighted ngram match
+    with open(keywords_dir / (lang + ".txt"), "r", encoding="utf-8") as f:
+        keywords = [x.strip() for x in f.readlines()]
 
-    # def make_weights(reference_tokens, key_word_list):
-    #     return {token: 1 if token in key_word_list else 0.2 for token in reference_tokens}
+    add_weighted_ngram_match_score = weighted_ngram_match.corpus_bleu_diff(
+        references,
+        hypothesis,
+        dev_diffs,
+        llm_diffs,
+        tokenizer=tokenizer,
+        keywords=keywords,
+        view="added",
+    )
 
-    # tokenized_refs_with_weights = [
-    #     [[reference_tokens, make_weights(reference_tokens, keywords)] for reference_tokens in reference]
-    #     for reference in tokenized_refs
-    # ]
-
-    # weighted_ngram_match_score = weighted_ngram_match.corpus_bleu(tokenized_refs_with_weights, tokenized_hyps)
-    weighted_ngram_match_score = 0  # TODO
+    del_weighted_ngram_match_score = weighted_ngram_match.corpus_bleu_diff(
+        references,
+        hypothesis,
+        dev_diffs,
+        llm_diffs,
+        tokenizer=tokenizer,
+        keywords=keywords,
+        view="deleted",
+    )
 
     # calculate syntax match
     add_syntax_match_score = syntax_match.corpus_syntax_match(
@@ -113,14 +122,14 @@ def calc_codebleu(
     alpha, beta, gamma, theta = weights
     add_code_bleu_score = (
         alpha * add_ngram_match_score
-        + beta * weighted_ngram_match_score
+        + beta * add_weighted_ngram_match_score
         + gamma * add_syntax_match_score
         + theta * (add_dataflow_match_score or 1)
     )
 
     del_code_bleu_score = (
         alpha * del_ngram_match_score
-        + beta * weighted_ngram_match_score
+        + beta * del_weighted_ngram_match_score
         + gamma * del_syntax_match_score
         + theta * (del_dataflow_match_score or 1)
     )
@@ -136,8 +145,8 @@ def calc_codebleu(
         "add_ngram_match_score": add_ngram_match_score,
         "del_ngram_match_score": del_ngram_match_score,
 
-        "add_weighted_ngram_match_score": weighted_ngram_match_score,
-        "del_weighted_ngram_match_score": weighted_ngram_match_score,
+        "add_weighted_ngram_match_score": add_weighted_ngram_match_score,
+        "del_weighted_ngram_match_score": del_weighted_ngram_match_score,
 
         "add_syntax_match_score": add_syntax_match_score,
         "del_syntax_match_score": del_syntax_match_score,
