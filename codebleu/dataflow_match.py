@@ -1,6 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
 import logging
+from typing import Optional
 
 from tree_sitter import Parser
 
@@ -17,7 +18,7 @@ from .parser import (
     remove_comments_and_docstrings,
     tree_to_token_index,
 )
-from .utils import get_tree_sitter_language
+from .utils import get_tree_sitter_language, get_mod_lines
 
 dfg_function = {
     "python": DFG_python,
@@ -33,11 +34,54 @@ dfg_function = {
 }
 
 
-def calc_dataflow_match(references, candidate, lang, langso_so_file):
-    return corpus_dataflow_match([references], [candidate], lang, langso_so_file)
+def calc_dataflow_match(
+    references,
+    candidate,
+    lang,
+    langso_so_file,
+    ref_diff: Optional[str] = None,
+    cand_diff: Optional[str] = None,
+    view: str = "added",
+):
+    """Compute the data-flow match between *candidate* and *references*.
+
+    The optional *ref_diff* and *cand_diff* arguments allow restricting the
+    comparison to only those data-flow nodes that originate from lines that are
+    part of the respective unified-diffs. Set *view* to "added" (default) to
+    consider added lines or to "deleted" to consider removed lines.
+    """
+
+    ref_diffs = [ref_diff] if ref_diff is not None else None
+    cand_diffs = [cand_diff] if cand_diff is not None else None
+
+    return corpus_dataflow_match(
+        [references],
+        [candidate],
+        lang,
+        ref_diffs=ref_diffs,
+        cand_diffs=cand_diffs,
+        tree_sitter_language=langso_so_file,
+        view=view,
+    )
 
 
-def corpus_dataflow_match(references, candidates, lang, tree_sitter_language=None):
+# NOTE: *ref_diffs* and *cand_diffs* are lists of unified diff strings whose
+#       indices correspond to *references* and *candidates* respectively. If
+#       they are *None*, the behaviour is identical to the original
+#       implementation (i.e., the entire file is considered).
+#       The *view* parameter can be either 'added' or 'deleted' and determines
+#       whether the diff lines refer to additions or deletions.
+
+
+def corpus_dataflow_match(
+    references,
+    candidates,
+    lang,
+    ref_diffs=None,
+    cand_diffs=None,
+    tree_sitter_language=None,
+    view: str = "added",
+):
     if not tree_sitter_language:
         tree_sitter_language = get_tree_sitter_language(lang)
 
@@ -49,29 +93,62 @@ def corpus_dataflow_match(references, candidates, lang, tree_sitter_language=Non
 
     for i in range(len(candidates)):
         references_sample = references[i]
-        candidate = candidates[i]
-        for reference in references_sample:
-            try:
-                candidate = remove_comments_and_docstrings(candidate, lang)
-            except Exception:
-                pass
-            try:
-                reference = remove_comments_and_docstrings(reference, lang)
-            except Exception:
-                pass
+        candidate_code = candidates[i]
 
-            cand_dfg = get_data_flow(candidate, parser)
-            ref_dfg = get_data_flow(reference, parser)
+        # Compute candidate diff line numbers if diffs are provided
+        cand_mod_lines = []
+        if cand_diffs is not None and i < len(cand_diffs):
+            cand_mod_lines = get_mod_lines(cand_diffs[i], view)
 
-            normalized_cand_dfg = normalize_dataflow(cand_dfg)
+        # Pre-compute candidate DFG and mapping once per reference set
+        try:
+            cleaned_candidate_code = remove_comments_and_docstrings(candidate_code, lang)
+        except Exception:
+            cleaned_candidate_code = candidate_code
+
+        cand_dfg_full = get_data_flow(cleaned_candidate_code, parser)
+        cand_idx_to_line = _idx_to_line_map(cleaned_candidate_code, parser)
+
+        # Filter candidate DFG if diff information is available
+        cand_dfg = _filter_dfg_by_lines(cand_dfg_full, cand_idx_to_line, cand_mod_lines)
+
+        # Normalise ONLY ONCE for efficiency. We'll copy later when we remove matched items.
+        normalized_cand_dfg = normalize_dataflow(list(cand_dfg))
+
+        for j, reference_code in enumerate(references_sample):
+            # Compute reference diff lines if provided
+            ref_mod_lines = []
+            if ref_diffs is not None and i < len(ref_diffs):
+                # ref_diffs is expected to be list of list? We'll assume list aligned to references list.
+                ref_diff_item = ref_diffs[i]
+                # If there are multiple references per sample, ref_diffs[i] could be list of diff strings.
+                # Support both structures.
+                if isinstance(ref_diff_item, list):
+                    if j < len(ref_diff_item):
+                        ref_mod_lines = get_mod_lines(ref_diff_item[j], view)
+                else:
+                    # Single diff for all refs in sample
+                    ref_mod_lines = get_mod_lines(ref_diff_item, view)
+
+            try:
+                cleaned_ref_code = remove_comments_and_docstrings(reference_code, lang)
+            except Exception:
+                cleaned_ref_code = reference_code
+
+            ref_dfg_full = get_data_flow(cleaned_ref_code, parser)
+            ref_idx_to_line = _idx_to_line_map(cleaned_ref_code, parser)
+            ref_dfg = _filter_dfg_by_lines(ref_dfg_full, ref_idx_to_line, ref_mod_lines)
+
             normalized_ref_dfg = normalize_dataflow(ref_dfg)
 
             if len(normalized_ref_dfg) > 0:
                 total_count += len(normalized_ref_dfg)
+                # Work on a copy of normalized_cand_dfg to prevent removing from original.
+                cand_dfg_working = normalized_cand_dfg.copy()
                 for dataflow in normalized_ref_dfg:
-                    if dataflow in normalized_cand_dfg:
+                    if dataflow in cand_dfg_working:
                         match_count += 1
-                        normalized_cand_dfg.remove(dataflow)
+                        cand_dfg_working.remove(dataflow)
     if total_count == 0:
         logging.warning(
             "WARNING: There is no reference data-flows extracted from the whole corpus, "
@@ -173,3 +250,58 @@ def normalize_dataflow(dataflow):
             )
         )
     return normalized_dataflow
+
+
+# Helper function to build mapping from token idx to source line number
+def _idx_to_line_map(code: str, parser):
+    """Return a mapping from the token enumeration index produced in get_data_flow
+    to the 1-based source line number of that token.
+
+    This reproduces the token enumeration logic used inside `get_data_flow` in order
+    to discover which data-flow nodes originate from lines modified in a diff.
+    The logic intentionally mirrors the implementation found in `get_data_flow`
+    so that the indices are aligned.
+    """
+    try:
+        tree = parser[0].parse(bytes(code, "utf8"))
+        root_node = tree.root_node
+        tokens_index = tree_to_token_index(root_node)
+        idx_to_line: dict[int, int] = {}
+        for idx, index in enumerate(tokens_index):
+            # `index` is a tuple ((row, col), (row, col)) – use the starting row.
+            start_line = index[0][0] + 1  # convert 0-based to 1-based
+            idx_to_line[idx] = start_line
+        return idx_to_line
+    except Exception:
+        # When tree-sitter fails to parse.
+        return {}
+
+
+# Helper to keep only those DFG items that are related to the supplied line numbers
+def _filter_dfg_by_lines(dfg: list, idx_to_line: dict[int, int], mod_lines: list[int]):
+    """Filter a data-flow graph so that only items whose variable or any of its
+    parent variables are defined on one of *mod_lines* are kept.
+    """
+    mod_lines_set = set(mod_lines)
+    if not mod_lines_set:
+        return dfg  # nothing to filter
+
+    filtered = []
+    for item in dfg:
+        if len(item) < 5:
+            # Unexpected shape – keep for safety.
+            continue
+        var_idx = item[1]
+        parent_indices = item[4]
+
+        line_numbers = []
+        if var_idx in idx_to_line:
+            line_numbers.append(idx_to_line[var_idx])
+        for pidx in parent_indices:
+            if pidx in idx_to_line:
+                line_numbers.append(idx_to_line[pidx])
+
+        if any(ln in mod_lines_set for ln in line_numbers):
+            filtered.append(item)
+
+    return filtered

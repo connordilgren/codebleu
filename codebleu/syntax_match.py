@@ -13,7 +13,7 @@ from .parser import (
     DFG_ruby,
     remove_comments_and_docstrings,
 )
-from .utils import get_tree_sitter_language
+from .utils import get_tree_sitter_language, cur_node_contains_mod_line, get_mod_lines
 
 dfg_function = {
     "python": DFG_python,
@@ -28,77 +28,6 @@ dfg_function = {
 
 def calc_syntax_match(references, candidate, lang):
     return corpus_syntax_match([references], [candidate], lang)
-
-
-def cur_node_contains_mod_line(cur_node, mod_lines: list[int]) -> bool:
-    """
-    returns true if the cur_node contains any of the mod_lines
-
-    Args:
-        cur_node: the current node to check
-        mod_lines: the lines that are modified in the candidate code
-    """
-    cur_node_start_row = cur_node.start_point[0] + 1 # first line is 0
-    cur_node_end_row = cur_node.end_point[0] + 1
-
-    return any(cur_node_start_row <= mod_line <= cur_node_end_row for mod_line in mod_lines)
-
-
-import re
-
-def get_mod_lines(diff, view):
-    """
-    Return the 1-based line numbers that are *added* or *deleted* in a
-    unified-diff string.
-
-    Args:
-        diff (str): Unified diff text containing exactly one file's changes.
-        view (str): Either 'added' (report new-file line numbers for lines
-                    beginning with '+') or 'deleted' (report old-file line
-                    numbers for lines beginning with '-').
-
-    Returns:
-        List[int]: Sorted list of line numbers matching the requested view.
-
-    Raises:
-        ValueError: If *view* is not 'added' or 'deleted'.
-    """
-    if view not in {"added", "deleted"}:
-        raise ValueError("view must be 'added' or 'deleted'")
-
-    # @@ -a,b +c,d @@  (b or d may be omitted ⇒ 1)
-    hunk_pat = re.compile(r'^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@')
-    mod_lines = []
-
-    old_ln = new_ln = None  # current line numbers for old/new files
-
-    for line in diff.splitlines():
-        # Detect the start of a new hunk and reset counters.
-        m = hunk_pat.match(line)
-        if m:
-            old_ln = int(m.group(1))
-            new_ln = int(m.group(3))
-            continue
-
-        # Ignore everything until the first hunk header.
-        if old_ln is None:
-            continue
-
-        # Classify the line and update counters.
-        if line.startswith(' '):          # context line
-            old_ln += 1
-            new_ln += 1
-        elif line.startswith('-'):        # deletion
-            if view == "deleted":
-                mod_lines.append(old_ln)
-            old_ln += 1
-        elif line.startswith('+'):        # addition
-            if view == "added":
-                mod_lines.append(new_ln)
-            new_ln += 1
-        # Other diff metadata (e.g., "\ No newline…") is ignored.
-
-    return mod_lines
 
 
 def corpus_syntax_match(references, candidates, ref_diffs, cand_diffs, lang, tree_sitter_language=None, view='added'):

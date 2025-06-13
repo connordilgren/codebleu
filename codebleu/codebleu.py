@@ -87,8 +87,12 @@ def calc_codebleu(
     )
 
     # calculate dataflow match
-    dataflow_match_score = dataflow_match.corpus_dataflow_match(
-        references, hypothesis, lang, tree_sitter_language=tree_sitter_language
+    add_dataflow_match_score = dataflow_match.corpus_dataflow_match(
+        references, hypothesis, lang, dev_diffs, llm_diffs, tree_sitter_language=tree_sitter_language, view='added'
+    )
+
+    del_dataflow_match_score = dataflow_match.corpus_dataflow_match(
+        references, hypothesis, lang, dev_diffs, llm_diffs, tree_sitter_language=tree_sitter_language, view='deleted'
     )
 
     alpha, beta, gamma, theta = weights
@@ -96,14 +100,14 @@ def calc_codebleu(
         alpha * ngram_match_score
         + beta * weighted_ngram_match_score
         + gamma * add_syntax_match_score
-        + theta * (dataflow_match_score or 1)
+        + theta * (add_dataflow_match_score or 1)
     )
 
     del_code_bleu_score = (
         alpha * ngram_match_score
         + beta * weighted_ngram_match_score
         + gamma * del_syntax_match_score
-        + theta * (dataflow_match_score or 1)
+        + theta * (del_dataflow_match_score or 1)
     )
 
     code_bleu_score = (add_code_bleu_score + del_code_bleu_score) / 2
@@ -123,8 +127,8 @@ def calc_codebleu(
         "add_syntax_match_score": add_syntax_match_score,
         "del_syntax_match_score": del_syntax_match_score,
 
-        "add_dataflow_match_score": dataflow_match_score,
-        "del_dataflow_match_score": dataflow_match_score,
+        "add_dataflow_match_score": add_dataflow_match_score,
+        "del_dataflow_match_score": del_dataflow_match_score,
     }
 
 
